@@ -81,6 +81,8 @@ python denoise_app.py      # 自动在浏览器打开 http://127.0.0.1:7865/
 
 Windows 上也可以双击 `去噪工具.bat`：它依次找环境变量 `DENOISE_PYTHON`、本文件夹的 `.venv`、`py` 启动器和 PATH 里的 Python，用第一个装好了依赖的。装有 NVIDIA 驱动时，torch 是 CPU 版的 Python 会被跳过，免得全局 Python 里的 CPU 版 torch 让你一直跑在 CPU 上；`DENOISE_PYTHON` 指定的不受这条限制，确实想用 CPU 版就设它。都没有就在窗口里运行一键安装（见下面「一键安装依赖」），装完自动打开。图片只在本机处理，不会上传；结果自动存到 `outputs/`（可用环境变量 `ANIME_DENOISE_OUTPUT` 改位置）。
 
+在本项目中，网页界面保存结果时还会自动导入 `tools/spaces-agents` 的任务放映室。归档保留规范化原图、最终结果、预缩比例、L0、设备、模型与代码校验值；自动保存显示为「已归档」。默认自动识别同级 Spaces Agents，路径不同时可用 `SPACES_AGENTS_ROOT`、`SPACES_AGENTS_PYTHON` 指定，设置 `ANIME_DENOISE_ARCHIVE=0` 可关闭。
+
 ![GUI 总览](examples/gui_compare.webp)
 
 ### 主要功能

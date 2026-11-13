@@ -796,6 +796,7 @@ async function runItem(it) {
     if (it.result) URL.revokeObjectURL(it.result.url);
     it.result = { img, url, blob, params: p, elapsed: +r.headers.get("X-Elapsed"), cached: r.headers.get("X-SR-Cached") === "1", device: r.headers.get("X-Device") };
     it.hasAlpha = r.headers.get("X-Alpha") === "1";
+    it.archiveReady = r.headers.get("X-Archive") === "ready";
     it.status = "done";
     if (S.cur === it) composite();
     scheduleSave(it, 0);
@@ -933,10 +934,14 @@ async function saveItem(it) {
   try {
     const name = outName(it);
     const blob = await finalBlob(it);
-    const j = await (await api(`/api/save?name=${encodeURIComponent(name)}`, { method: "POST", body: blob })).json();
+    let path = `/api/save?name=${encodeURIComponent(name)}&source_name=${encodeURIComponent(it.name)}`;
+    if (it.job) path += `&job=${encodeURIComponent(it.job)}`;
+    const j = await (await api(path, { method: "POST", body: blob })).json();
     it.saved = j.file;
+    it.archived = !!(j.archive && j.archive.ok);
+    if (j.archive && j.archive.enabled && !j.archive.ok) toast("已保存，但 Spaces Agents 归档失败：" + j.archive.error, "err", 9000);
   } catch (e) { it.saved = ""; toast("自动保存失败：" + e.message, "err"); }
-  if (it === S.cur) { $("#bSaved").textContent = it.saved ? "已保存" : ""; syncPanel(); }
+  if (it === S.cur) { $("#bSaved").textContent = it.saved ? (it.archived ? "已归档" : "已保存") : ""; syncPanel(); }
 }
 async function download() {
   const it = S.cur;
@@ -1032,7 +1037,7 @@ function syncPanel() {
   const fn = $("#footNote");
   fn.textContent = "";
   if (it && it.saved) {
-    fn.append("已自动保存：");
+    fn.append(it.archived ? "已保存并归档到 Spaces Agents：" : "已自动保存：");
     const b = document.createElement("span"); b.className = "flink"; b.tabIndex = 0; b.setAttribute("role", "button");
     b.textContent = it.saved; b.title = "在文件夹中显示"; b.onclick = () => reveal(it.saved);
     b.onkeydown = e => { if (e.key === "Enter") reveal(it.saved); };

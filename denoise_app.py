@@ -20,6 +20,7 @@ import time
 import urllib.request
 import webbrowser
 from collections import OrderedDict
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -66,6 +67,12 @@ PAGE = HERE / "app" / "index.html"
 ICON = HERE / "app" / "icon.ico"
 OUTPUT = Path(os.environ.get("ANIME_DENOISE_OUTPUT", HERE / "outputs"))
 MODELS_DIR = Path.home() / ".cache" / "gpt-anime-denoise"
+PROJECT_ROOT = HERE.parents[1]
+SPACES_AGENTS_ROOT = Path(os.environ.get("SPACES_AGENTS_ROOT", PROJECT_ROOT / "tools" / "spaces-agents"))
+SPACES_ARCHIVER = SPACES_AGENTS_ROOT / "archive_imagegen.py"
+SPACES_PYTHON = Path(os.environ.get("SPACES_AGENTS_PYTHON", PROJECT_ROOT / "python" / "python.exe"))
+ARCHIVE_ENABLED = os.environ.get("ANIME_DENOISE_ARCHIVE", "1") != "0"
+ARCHIVE_JOBS = OUTPUT / ".spaces-agents" / "jobs"
 DEVICE = dn.default_device()
 DEVICE_NAME = (dn.torch.cuda.get_device_name(0) if DEVICE == "cuda"
                else "Apple GPU (MPS)" if DEVICE == "mps" else "CPU")  # ASCII: it also goes into a response header
@@ -85,6 +92,7 @@ lock = threading.Lock()
 models = {}
 progress = {"busy": False, "stage": "", "started": 0.0, "job": ""}
 cancelled = set()  # job ids the page gave up on; checked between steps and inside the L0 loop
+archive_lock = threading.Lock()
 
 
 def stage(text):
@@ -161,6 +169,124 @@ def normalize(data):
     buf = io.BytesIO()
     dn.save_png(rgb, buf, alpha, icc, compress_level=1)
     return buf.getvalue(), rgb.size, alpha is not None
+
+
+def archive_ready():
+    return ARCHIVE_ENABLED and SPACES_ARCHIVER.is_file() and SPACES_PYTHON.is_file()
+
+
+def valid_job(job):
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", job))
+
+
+def git_value(*args):
+    try:
+        return subprocess.run(["git", "-C", str(HERE), *args], capture_output=True, text=True,
+                              encoding="utf-8", timeout=5).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def stage_archive_input(job, data, down, lam, started_at, completed_at, size, cached, has_alpha):
+    if not archive_ready() or not valid_job(job):
+        return False
+    folder = ARCHIVE_JOBS / job
+    folder.mkdir(parents=True, exist_ok=True)
+    source = folder / "source.png"
+    temporary = folder / "source.png.tmp"
+    temporary.write_bytes(data)
+    temporary.replace(source)
+    record = {
+        "job": job, "source": str(source), "source_sha256": hashlib.sha256(data).hexdigest(),
+        "started_at": started_at, "completed_at": completed_at, "down": down, "l0": lam,
+        "size": list(size), "cached": cached, "has_alpha": has_alpha,
+    }
+    temporary = folder / "job.json.tmp"
+    temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(folder / "job.json")
+    return True
+
+
+def archive_output(job, output, output_name, source_name):
+    if not ARCHIVE_ENABLED:
+        return {"ok": False, "enabled": False, "error": "Spaces Agents 归档已关闭"}
+    if not archive_ready():
+        return {"ok": False, "enabled": True, "error": "Spaces Agents 归档环境不可用"}
+    if not valid_job(job):
+        return {"ok": False, "enabled": True, "error": "保存请求缺少有效的去噪任务 ID"}
+    folder = ARCHIVE_JOBS / job
+    record_path = folder / "job.json"
+    if not record_path.is_file():
+        return {"ok": False, "enabled": True, "error": "找不到本次去噪的原始输入，请重新运行去噪"}
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    source = Path(record["source"])
+    if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != record["source_sha256"]:
+        return {"ok": False, "enabled": True, "error": "保存的原始输入校验失败"}
+    completed = datetime.now(timezone.utc).isoformat()
+    model_path = MODELS_DIR / dn.MODELS["esrgan"][0]
+    model_hash = None
+    if model_path.is_file():
+        with model_path.open("rb") as handle:
+            model_hash = hashlib.file_digest(handle, "sha256").hexdigest()
+    revision = git_value("rev-parse", "HEAD")
+    upstream = git_value("remote", "get-url", "upstream") or "https://github.com/CXP-2024/gpt-anime-denoise"
+    custom_repository = git_value("remote", "get-url", "origin")
+    execution = {
+        "entry": "Local web GUI", "endpoint": "gpt-anime-denoise/denoise_app.py",
+        "provider": "local-postprocess", "model": "RealESRGAN_x4plus_anime_6B",
+        "upstream": upstream, "custom_repository": custom_repository, "revision": revision,
+        "script_sha256": hashlib.sha256((HERE / "denoise.py").read_bytes()).hexdigest(),
+        "source_sha256": record["source_sha256"], "output_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+        "model_sha256": model_hash, "device": DEVICE_NAME, "cached": record["cached"],
+        "started_at": record["started_at"], "completed_at": completed, "status": "succeeded",
+        "automatic_retry": False,
+    }
+    parameters = {
+        "method": "esrgan60_l0", "down": record["down"], "l0": record["l0"],
+        "device": DEVICE_NAME, "cached": record["cached"], "source_pixels": record["size"],
+    }
+    task_name = (Path(source_name).stem or Path(output_name).stem) + " · 本地去噪"
+    manifest = {
+        "thread_id": None,
+        "items": [{
+            "name": task_name, "output": str(output), "references": [str(source)], "prompt": None,
+            "generated_at": completed, "started_at": record["started_at"], "completed_at": completed,
+            "parameters": parameters, "execution": execution,
+            "postprocess": {
+                "tool": "gpt-anime-denoise", "request_id": job, "source_sha256": record["source_sha256"],
+                "source_manifest": None, "source_generation": None, "source_knowledge": None,
+            },
+            "knowledge": {
+                "queries": ["鱼鳞纹 去噪", "ESRGAN L0"], "adopted_ids": [],
+                "limitation": "Knowledge 查询未命中；参数采用作者 SKILL/README。",
+                "sources": [upstream.rstrip("/") + "/blob/" + revision + "/README.md"] if revision else [upstream],
+            },
+            "official_preflight": {
+                "repository": upstream, "custom_repository": custom_repository, "revision": revision,
+                "skill": upstream.rstrip("/") + "/blob/" + revision + "/SKILL.md" if revision else None,
+                "scope": "项目作者提供的本地后处理；非 OpenAI 官方工具",
+            },
+            "notes": "由本地网页界面自动保存。原图、L0、预缩比例和设备随结果归档；未提交新的生成请求。",
+        }],
+    }
+    manifest_path = folder / "archive.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with archive_lock:
+        try:
+            result = subprocess.run(
+                [str(SPACES_PYTHON), str(SPACES_ARCHIVER), str(manifest_path), "--archive-root", str(SPACES_AGENTS_ROOT)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=60, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {"ok": False, "enabled": True, "error": f"调用归档器失败：{type(exc).__name__}"}
+    if result.returncode:
+        message = (result.stderr or result.stdout).strip()[-1200:]
+        return {"ok": False, "enabled": True, "error": message or f"归档器退出码 {result.returncode}"}
+    try:
+        imported = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {"ok": False, "enabled": True, "error": "归档器返回了无法解析的结果"}
+    return {"ok": True, "enabled": True, **imported}
 
 
 sr_cache = OrderedDict()  # (image hash, downscale) -> super-resolved image; changing only L0 skips the model
@@ -257,7 +383,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/info":
             self._json({"app": "anime-denoise", "version": VERSION, "pid": os.getpid(), "busy": progress["busy"],
                         "device": DEVICE_NAME, "gpu_note": dn.GPU_NOTE, "down": 0.6, "l0": dn.L0, "output": str(OUTPUT),
-                        "max_bytes": MAX_BYTES, "pixels": {"recommend": RECOMMEND_PIXELS, "warn": WARN_PIXELS, "max": MAX_PIXELS}, "seg_ready": (MODELS_DIR / dn.MODELS["animeseg"][0]).is_file()})
+                        "max_bytes": MAX_BYTES, "pixels": {"recommend": RECOMMEND_PIXELS, "warn": WARN_PIXELS, "max": MAX_PIXELS},
+                        "seg_ready": (MODELS_DIR / dn.MODELS["animeseg"][0]).is_file(),
+                        "archive": {"enabled": ARCHIVE_ENABLED, "ready": archive_ready(), "root": str(SPACES_AGENTS_ROOT)}})
         elif path == "/api/progress":
             p = dict(progress)
             p["elapsed"] = round(time.time() - p["started"], 1) if p["busy"] else 0
@@ -307,13 +435,19 @@ class Handler(BaseHTTPRequestHandler):
                 down = min(max(float(q.get("down", ["0.6"])[0]), 0.1), 1.0)
                 lam = min(max(float(q.get("l0", [str(dn.L0)])[0]), 0.0), 0.05)
                 job = q.get("job", [""])[0][:64]
+                source_data = self._body()
+                started_at = datetime.now(timezone.utc).isoformat()
                 try:
-                    png, elapsed, (w, h), cached, has_alpha = process(self._body(), down, lam, job)
+                    png, elapsed, (w, h), cached, has_alpha = process(source_data, down, lam, job)
                 except dn.Cancelled:
                     return self._json({"cancelled": True}, 409)
+                completed_at = datetime.now(timezone.utc).isoformat()
+                staged = stage_archive_input(job, source_data, down, lam, started_at, completed_at,
+                                             (w, h), cached, has_alpha)
                 return self._send(200, png, "image/png", {
                     "X-Elapsed": f"{elapsed:.1f}", "X-Device": DEVICE_NAME, "X-Size": f"{w}x{h}",
-                    "X-SR-Cached": "1" if cached else "0", "X-Alpha": "1" if has_alpha else "0"})
+                    "X-SR-Cached": "1" if cached else "0", "X-Alpha": "1" if has_alpha else "0",
+                    "X-Archive": "ready" if staged else ("disabled" if not ARCHIVE_ENABLED else "unavailable")})
             if u.path == "/api/segment":
                 png, share = segment(self._body())
                 return self._send(200, png, "image/png", {"X-Share": f"{share:.4f}"})
@@ -336,8 +470,12 @@ class Handler(BaseHTTPRequestHandler):
                 OUTPUT.mkdir(parents=True, exist_ok=True)
                 tmp = OUTPUT / (name + ".tmp")
                 tmp.write_bytes(data)
-                tmp.replace(OUTPUT / name)
-                return self._json({"file": name, "dir": str(OUTPUT)})
+                destination = OUTPUT / name
+                tmp.replace(destination)
+                job = q.get("job", [""])[0][:64]
+                archive = archive_output(job, destination, name, q.get("source_name", [name])[0]) if job else {
+                    "ok": False, "enabled": ARCHIVE_ENABLED, "error": "保存请求缺少去噪任务 ID"}
+                return self._json({"file": name, "dir": str(OUTPUT), "archive": archive})
             if u.path == "/api/reveal":
                 OUTPUT.mkdir(parents=True, exist_ok=True)
                 name = q.get("name", [""])[0]
