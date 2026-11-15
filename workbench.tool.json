@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "name": "Anime Denoise · GPT 风味去噪",
+  "description": "本机 GPT 动漫图去噪 GUI，处理鱼鳞纹、碎片化细节和碎片化阴影，并把结果归档到 Spaces Agents。",
+  "entry_url": "http://127.0.0.1:7865/",
+  "adapter": "link_only",
+  "tags": ["图像后处理", "去噪", "GPT 图像", "本地工具"],
+  "lifecycle": {
+    "initialization": "使用工具自己的 .venv 和已验证模型；缺少环境时按 README.md 运行 setup_env.py。不要用工作台 Python 替代该环境。",
+    "migration": "保留仓库、SKILL.md、模型来源说明和必要配置；不复制 .venv、缓存或旧进程状态。新电脑重新初始化依赖并核对 GPU。",
+    "docs": ["README.md", "SKILL.md"],
+    "readiness": "review",
+    "init_argv": [],
+    "start_argv": ["{root}/.venv/Scripts/python.exe", "{root}/denoise_app.py", "--no-browser"],
+    "health_url": "http://127.0.0.1:7865/api/info",
+    "health_expect": {"app": "anime-denoise"},
+    "auto_start": false,
+    "verification": "启动后 /api/info 应返回 app=anime-denoise；archive.enabled/ready 表示结果可写入 Spaces Agents，不触发生成任务。",
+    "auth_argv": [],
+    "verify_argv": []
+  }
+}

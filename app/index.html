@@ -338,6 +338,7 @@
   <symbol id="i-lr" viewBox="0 0 24 24"><path d="m9 7-5 5 5 5M15 7l5 5-5 5"/></symbol>
   <symbol id="i-lasso" viewBox="0 0 24 24"><path d="M6.6 14.2C4.4 13.1 3 11.4 3 9.5 3 6 7 3.5 12 3.5s9 2.5 9 6-4 6-9 6c-1.1 0-2.2-.1-3.2-.4"/><circle cx="7.6" cy="15.6" r="1.6"/><path d="M7.4 17.2c.2 1.6 1.4 2.6 3.1 3.1"/></symbol>
   <symbol id="i-invert" viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="17" height="17" rx="3"/><path d="M12 3.5h5.5a3 3 0 0 1 3 3v11a3 3 0 0 1-3 3H12z" fill="currentColor"/></symbol>
+  <symbol id="i-workbench" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
 </svg>
 
 <div class="app">
@@ -346,6 +347,7 @@
     <div class="brand"><b>Anime Denoise</b><span title="去除 GPT 风味噪点（包括但不限于鱼鳞状纹理、碎片化细节、碎片化阴影）">去除 GPT 风味噪点（包括但不限于鱼鳞状纹理、碎片化细节、碎片化阴影）</span></div>
     <div class="top-actions">
       <span class="chip-dev" id="devChip" title="图片只在这台电脑上处理" hidden><i></i><span id="devName">本机处理</span></span>
+      <a class="tbtn" href="http://127.0.0.1:8766/#/overview" style="text-decoration:none"><svg class="i"><use href="#i-workbench"/></svg><span>返回工作台</span></a>
       <button class="tbtn" id="openOut" title="打开输出文件夹"><svg class="i"><use href="#i-folder"/></svg><span>输出文件夹</span></button>
       <button class="tbtn" id="themeBtn" title="切换外观"><svg class="i"><use id="themeIcon" href="#i-auto"/></svg><span id="themeLabel">跟随系统</span></button>
       <button class="tbtn" id="helpBtn" title="说明与快捷键（?）"><svg class="i"><use href="#i-help"/></svg><span>说明</span></button>
