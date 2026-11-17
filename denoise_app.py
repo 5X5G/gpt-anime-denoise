@@ -188,7 +188,7 @@ def git_value(*args):
 
 
 def stage_archive_input(job, data, down, lam, started_at, completed_at, size, cached, has_alpha):
-    if not archive_ready() or not valid_job(job):
+    if not valid_job(job):
         return False
     folder = ARCHIVE_JOBS / job
     folder.mkdir(parents=True, exist_ok=True)
@@ -205,6 +205,72 @@ def stage_archive_input(job, data, down, lam, started_at, completed_at, size, ca
     temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temporary.replace(folder / "job.json")
     return True
+
+
+def history_record(job):
+    if not valid_job(job):
+        raise ValueError("无效的历史记录 ID")
+    folder = ARCHIVE_JOBS / job
+    record = json.loads((folder / "job.json").read_text(encoding="utf-8"))
+    history = folder / "history.json"
+    if history.is_file():
+        item = json.loads(history.read_text(encoding="utf-8"))
+        output = folder / "result.png"
+    else:
+        manifest = json.loads((folder / "archive.json").read_text(encoding="utf-8"))["items"][0]
+        output = Path(manifest["output"])
+        if output.parent.resolve() != OUTPUT.resolve():
+            raise ValueError("历史结果位置无效")
+        item = {"name": manifest["name"].removesuffix(" · 本地去噪"),
+                "output_sha256": manifest["execution"]["output_sha256"],
+                "saved": output.name, "time": manifest.get("completed_at", record["completed_at"])}
+    if not (folder / "source.png").is_file() or not output.is_file():
+        raise ValueError("原图或结果文件缺失")
+    return record, item, output
+
+
+def history_list(offset, limit=20):
+    if not ARCHIVE_JOBS.is_dir():
+        return {"items": [], "more": False}
+    # Only inspect this tool's job folder; bound the directory work and metadata reads.
+    with os.scandir(ARCHIVE_JOBS) as entries:
+        folders = []
+        for entry in entries:
+            if len(folders) >= 2000:
+                break
+            if entry.is_dir(follow_symlinks=False) and valid_job(entry.name):
+                folders.append(entry.name)
+    items = []
+    for job in folders:
+        try:
+            record, item, _ = history_record(job)
+            created = record.get("started_at") or record["completed_at"]
+            created_at = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            items.append((created_at.timestamp(), job,
+                          {"job": job, "name": item["name"], "time": created,
+                           "down": record["down"], "l0": record["l0"], "size": record["size"],
+                           "has_alpha": record.get("has_alpha", False), "saved": item.get("saved", "")}))
+        except (OSError, ValueError, KeyError, TypeError, IndexError, OverflowError):
+            continue
+    items.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
+    return {"items": [entry[2] for entry in items[offset:offset + limit]], "more": len(items) > offset + limit,
+            "limited": len(folders) >= 2000}
+
+
+def save_history(job, data, name, saved):
+    if not valid_job(job) or not (ARCHIVE_JOBS / job / "job.json").is_file():
+        return
+    folder = ARCHIVE_JOBS / job
+    temporary = folder / "result.png.tmp"
+    temporary.write_bytes(data)
+    temporary.replace(folder / "result.png")
+    item = {"name": name, "saved": saved, "time": datetime.now(timezone.utc).isoformat(),
+            "output_sha256": hashlib.sha256(data).hexdigest()}
+    temporary = folder / "history.json.tmp"
+    temporary.write_text(json.dumps(item, ensure_ascii=False) + "\n", encoding="utf-8")
+    temporary.replace(folder / "history.json")
 
 
 def archive_output(job, output, output_name, source_name):
@@ -447,7 +513,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, png, "image/png", {
                     "X-Elapsed": f"{elapsed:.1f}", "X-Device": DEVICE_NAME, "X-Size": f"{w}x{h}",
                     "X-SR-Cached": "1" if cached else "0", "X-Alpha": "1" if has_alpha else "0",
-                    "X-Archive": "ready" if staged else ("disabled" if not ARCHIVE_ENABLED else "unavailable")})
+                    "X-Archive": "ready" if staged and archive_ready() else ("disabled" if not ARCHIVE_ENABLED else "unavailable")})
             if u.path == "/api/segment":
                 png, share = segment(self._body())
                 return self._send(200, png, "image/png", {"X-Share": f"{share:.4f}"})
@@ -461,6 +527,29 @@ class Handler(BaseHTTPRequestHandler):
                     if len(cancelled) > 200:  # stale ids of jobs that never arrived
                         cancelled.clear()
                 return self._json({"ok": True, "running": progress["job"] == job})
+            if u.path == "/api/history":
+                offset = min(max(int(q.get("offset", ["0"])[0]), 0), 1980)
+                return self._json(history_list(offset))
+            if u.path == "/api/history-thumb":
+                job = q.get("job", [""])[0]
+                history_record(job)
+                with Image.open(ARCHIVE_JOBS / job / "source.png") as im:
+                    im.thumbnail((128, 128))
+                    out = io.BytesIO()
+                    im.save(out, format="PNG")
+                return self._send(200, out.getvalue(), "image/png")
+            if u.path == "/api/history-image":
+                job = q.get("job", [""])[0]
+                kind = q.get("kind", [""])[0]
+                record, item, output = history_record(job)
+                if kind not in ("source", "result"):
+                    raise ValueError("无效的图片类型")
+                path = ARCHIVE_JOBS / job / "source.png" if kind == "source" else output
+                expected = record["source_sha256"] if kind == "source" else item["output_sha256"]
+                data = path.read_bytes()
+                if hashlib.sha256(data).hexdigest() != expected:
+                    raise ValueError("历史图片已被修改或覆盖，无法安全恢复")
+                return self._send(200, data, "image/png")
             if u.path == "/api/save":
                 data = self._body()
                 with Image.open(io.BytesIO(data)) as im:
@@ -473,6 +562,7 @@ class Handler(BaseHTTPRequestHandler):
                 destination = OUTPUT / name
                 tmp.replace(destination)
                 job = q.get("job", [""])[0][:64]
+                save_history(job, data, q.get("source_name", [name])[0], name)
                 archive = archive_output(job, destination, name, q.get("source_name", [name])[0]) if job else {
                     "ok": False, "enabled": ARCHIVE_ENABLED, "error": "保存请求缺少去噪任务 ID"}
                 return self._json({"file": name, "dir": str(OUTPUT), "archive": archive})

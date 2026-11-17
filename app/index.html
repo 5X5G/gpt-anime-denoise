@@ -271,6 +271,9 @@
   .sbadge.mask { left: -4px; right: auto; background: rgb(var(--mask)); color: #fff; }
   .sdel { position: absolute; top: -6px; right: -6px; width: 20px; height: 20px; border-radius: 50%; background: var(--primary); color: var(--on-primary); display: none; place-items: center; font-size: 12px; line-height: 1; }
   .sitem:hover .sdel { display: grid; }
+  .history-thumb { padding: 0; }
+  .history-thumb[aria-busy="true"] { opacity: .6; }
+  .history-more { flex: none; white-space: nowrap; }
   .strip-note { color: var(--faint); font-size: 12px; margin-left: 4px; white-space: nowrap; }
 
   /* ---------- overlays ---------- */
@@ -418,6 +421,7 @@
         <button class="btn primary" id="dlBtn" disabled><svg class="i"><use href="#i-down"/></svg>下载 PNG</button>
         <button class="btn icon" id="revealBtn" title="在文件夹中显示" disabled><svg class="i"><use href="#i-folder"/></svg></button>
       </div>
+      <button class="btn wide" id="copyBtn" style="margin-top:8px" title="复制完整结果图片，包含保护和上色修补" disabled>复制图片</button>
       <div class="foot-note" id="footNote">结果也会自动保存到 outputs 文件夹</div>
     </footer>
   </aside>
@@ -499,6 +503,8 @@
     <div class="strip" id="strip">
       <button class="sadd" id="stripAdd" title="添加图片（Ctrl+O）"><svg class="i"><use href="#i-plus"/></svg></button>
       <div id="stripItems" style="display:flex;gap:12px;align-items:center"></div>
+      <div id="historyItems" style="display:flex;gap:12px;align-items:center"></div>
+      <button class="btn history-more" id="historyMore" hidden>更多历史</button>
       <span class="strip-note" id="stripNote"></span>
     </div>
   </main>
@@ -682,6 +688,100 @@ function makeThumb(img) {
   c.width = Math.max(1, Math.round(img.naturalWidth * k)); c.height = Math.max(1, Math.round(img.naturalHeight * k));
   c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
   return c.toDataURL("image/png");
+}
+let historyOffset = 0, thumbBusy = false;
+const historyThumbs = new Map(), thumbQueue = [], thumbQueued = new Set();
+const thumbObserver = new IntersectionObserver(entries => {
+  for (const seen of entries) {
+    const job = seen.target.dataset.job;
+    if (seen.isIntersecting && !historyThumbs.has(job) && !thumbQueued.has(job)) {
+      thumbQueued.add(job); thumbQueue.push(job); loadNextThumb();
+    }
+  }
+}, { root: $("#strip") });
+async function loadNextThumb() {
+  if (thumbBusy || !thumbQueue.length) return;
+  const job = thumbQueue.shift(); thumbBusy = true;
+  try {
+    const blob = await (await api(`/api/history-thumb?job=${encodeURIComponent(job)}`, { method: "POST" })).blob();
+    const url = URL.createObjectURL(blob); historyThumbs.set(job, url);
+    const button = [...$("#historyItems").children].find(el => el.dataset.job === job);
+    if (button) button.querySelector("img").src = url;
+  } catch { historyThumbs.set(job, ""); }
+  finally { thumbQueued.delete(job); thumbBusy = false; loadNextThumb(); }
+}
+function syncHistoryStrip() {
+  for (const button of $("#historyItems").children) {
+    const it = S.items.find(item => item.historyJob === button.dataset.job);
+    button.hidden = S.items.some(item => !item.historyJob && item.job === button.dataset.job);
+    button.classList.toggle("cur", !!it && it === S.cur);
+    button.querySelectorAll(".sbadge, .sdel").forEach(el => el.remove());
+    if (!it) continue;
+    const badge = document.createElement("span"); badge.className = "sbadge";
+    if (it.status === "running") { badge.classList.add("run"); badge.innerHTML = '<span class="spin"></span>'; }
+    else if (it.status === "queued") { badge.classList.add("wait"); badge.textContent = S.queue.indexOf(it) + 1; badge.title = "排队中"; }
+    else if (it.status === "error") { badge.classList.add("err"); badge.textContent = "!"; badge.title = it.err; }
+    else if (it.result) { badge.classList.add("ok"); badge.textContent = "✓"; }
+    if (badge.className !== "sbadge") button.appendChild(badge);
+    if (it.hasMask) {
+      const mask = document.createElement("span"); mask.className = "sbadge mask"; mask.title = "已涂保护区";
+      mask.innerHTML = '<svg class="i" style="width:11px;height:11px"><use href="#i-shield"/></svg>'; button.appendChild(mask);
+    }
+    const remove = document.createElement("button"); remove.className = "sdel"; remove.textContent = "×"; remove.title = "移除";
+    remove.onclick = e => { e.stopPropagation(); removeItem(it); }; button.appendChild(remove);
+  }
+}
+async function loadHistory() {
+  const box = $("#historyItems"), more = $("#historyMore");
+  more.disabled = true;
+  try {
+    const data = await (await api(`/api/history?offset=${historyOffset}`, { method: "POST" })).json();
+    for (const entry of data.items) {
+      const button = document.createElement("div"); button.className = "sitem history-thumb"; button.dataset.job = entry.job;
+      button.setAttribute("role", "button"); button.tabIndex = 0;
+      button.title = `${entry.name} · ${new Date(entry.time).toLocaleString()} · 点击打开历史`;
+      button.setAttribute("aria-label", button.title);
+      const img = document.createElement("img"); img.alt = ""; button.appendChild(img);
+      button.onclick = () => openHistory(entry, button);
+      button.onkeydown = e => { if (e.target === button && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); openHistory(entry, button); } };
+      box.appendChild(button); thumbObserver.observe(button);
+    }
+    historyOffset += data.items.length; more.hidden = !data.more; more.textContent = "更多历史";
+    if (data.limited) toast("历史记录较多，当前只搜索了部分记录", "", 6000);
+    syncHistoryStrip();
+  } catch (e) {
+    const message = e.message === "没有这个操作" ? "后台还是旧版本，请重启去噪工具" : e.message;
+    toast("读取历史失败：" + message, "err", 7000);
+    more.hidden = false; more.textContent = "重试历史";
+  } finally { more.disabled = false; }
+}
+$("#historyMore").onclick = () => loadHistory();
+async function openHistory(entry, button) {
+  const existing = S.items.find(it => it.historyJob === entry.job);
+  if (existing) { select(existing); return; }
+  if (button.getAttribute("aria-busy") === "true") return;
+  button.setAttribute("aria-busy", "true");
+  let srcURL, resultURL;
+  try {
+    const base = `/api/history-image?job=${encodeURIComponent(entry.job)}&kind=`;
+    const source = await (await api(base + "source", { method: "POST" })).blob();
+    const result = await (await api(base + "result", { method: "POST" })).blob();
+    srcURL = URL.createObjectURL(source); resultURL = URL.createObjectURL(result);
+    const img = await loadImg(srcURL), resultImg = await loadImg(resultURL);
+    const w = img.naturalWidth, h = img.naturalHeight;
+    if (w !== resultImg.naturalWidth || h !== resultImg.naturalHeight) throw new Error("原图与结果尺寸不一致");
+    const mask = mk(); mask.width = w; mask.height = h;
+    const mc = mask.getContext("2d", { willReadFrequently: true }); mc.fillStyle = "#000"; mc.fillRect(0, 0, w, h);
+    const params = { down: Math.round(entry.down * 100), l0: entry.l0 };
+    const it = { id: nextId++, historyJob: entry.job, job: entry.job, file: source, hasAlpha: entry.has_alpha,
+      name: entry.name, stem: entry.name.replace(/\.[^.]+$/, ""), w, h, srcURL, srcImg: img, thumb: makeThumb(img),
+      params, feather: S.feather, result: { img: resultImg, url: resultURL, blob: result, params, elapsed: 0, cached: false, device: "" },
+      status: "done", err: "", mask, hasMask: false, undo: [], redo: [], saved: entry.saved, saveTimer: 0 };
+    S.items.push(it); select(it);
+  } catch (e) {
+    if (srcURL) URL.revokeObjectURL(srcURL); if (resultURL) URL.revokeObjectURL(resultURL);
+    toast("无法打开历史：" + e.message, "err", 7000);
+  } finally { button.removeAttribute("aria-busy"); }
 }
 // a pasted image has no name of its own; the paste time keeps a later session's auto-save from overwriting this one
 function pasteStamp(d = new Date()) {
@@ -954,6 +1054,15 @@ async function download() {
   setTimeout(() => URL.revokeObjectURL(u), 5000);
 }
 $("#dlBtn").onclick = download;
+$("#copyBtn").onclick = async () => {
+  const it = S.cur;
+  if (!it || !it.result) return;
+  try {
+    if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined") throw new Error("当前浏览器不支持复制图片，请使用下载 PNG");
+    await navigator.clipboard.write([new ClipboardItem({ "image/png": finalBlob(it) })]);
+    toast("图片已复制，可直接粘贴");
+  } catch (e) { toast("复制图片失败：" + e.message, "err", 6000); }
+};
 const reveal = name => api("/api/reveal" + (name ? `?name=${encodeURIComponent(name)}` : ""), { method: "POST" }).catch(e => toast(e.message, "err"));
 $("#openOut").onclick = () => reveal("");
 $("#revealBtn").onclick = () => reveal(S.cur?.saved || "");
@@ -1016,6 +1125,7 @@ function syncPanel() {
   syncParams();
   const ready = !!(it && it.result);
   $("#dlBtn").disabled = !ready;
+  $("#copyBtn").disabled = !ready;
   $("#revealBtn").disabled = !(it && it.saved);
   $("#brushBtn").disabled = !it;
   // three separate tools in the side panel: only the one in use lights up
@@ -1062,6 +1172,7 @@ function renderStrip() {
   const box = $("#stripItems");
   box.textContent = "";
   for (const it of S.items) {
+    if (it.historyJob && [...$("#historyItems").children].some(button => button.dataset.job === it.historyJob)) continue;
     const d = document.createElement("div");
     d.className = "sitem" + (it === S.cur ? " cur" : "");
     d.title = it.name;
@@ -1081,6 +1192,7 @@ function renderStrip() {
   }
   const done = S.items.filter(i => i.result).length;
   $("#stripNote").textContent = S.items.length > 1 ? `${done} / ${S.items.length} 张完成` : "";
+  syncHistoryStrip();
 }
 function select(it) {
   if (S.cur === it) return;
@@ -1959,7 +2071,7 @@ addEventListener("keyup", e => {
 });
 addEventListener("blur", () => { S.space = S.peekOrig = S.peekMask = S.pickHeld = false; S.spaceMode = ""; $("#sizeTip").hidden = true; render(); updateCursor(); });
 
-syncBrushUI(); syncPanel(); renderStrip(); render();
+syncBrushUI(); syncPanel(); renderStrip(); render(); loadHistory();
 </script>
 </body>
 </html>
